@@ -1,1 +1,22 @@
+services:
+  pumpfun-resurrection-agent:
+    build: .
+    container_name: pumpfun-resurrection-agent
+    restart: unless-stopped
+    ports:
+      - "3002:3002"
+    volumes:
+      - pumpfun_resurrection_data:/data
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      MIN_PEAK_MC: ${MIN_PEAK_MC}
+      SOFT_ALERT_MC: ${SOFT_ALERT_MC}
+      HARD_ALERT_MC: ${HARD_ALERT_MC}
+      BOUNCE_PERCENT: ${BOUNCE_PERCENT}
+      RESET_MC: ${RESET_MC}
+      POLL_SECONDS: ${POLL_SECONDS}
+      HEARTBEAT_MINUTES: ${HEARTBEAT_MINUTES}
 
+volumes:
+  pumpfun_resurrection_data:
