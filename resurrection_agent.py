@@ -3,7 +3,8 @@ import time
 import json
 import html
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
@@ -20,22 +21,28 @@ RESET_MC = float(os.getenv("RESET_MC", "25000"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
 HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "60"))
 
+DIGEST_HOUR_CT = int(os.getenv("DIGEST_HOUR_CT", "8"))
+OVERNIGHT_START_HOUR_CT = int(os.getenv("OVERNIGHT_START_HOUR_CT", "22"))
+TRACK_UNQUALIFIED_HOURS = int(os.getenv("TRACK_UNQUALIFIED_HOURS", "24"))
+
 STATE_FILE = "/data/resurrection_state.json"
 OFFSET_FILE = "/data/telegram_offset.json"
 
+CENTRAL = ZoneInfo("America/Chicago")
+
 start_time = time.time()
 ws_connected = False
-
 tokens_seen = 0
 alerts_sent = 0
 last_coin = "None yet"
 last_alert = "None yet"
-
 seen_mints = set()
 
 state = {
     "coins": {},
-    "manual": []
+    "overnight": False,
+    "digest_queue": [],
+    "last_digest_date": ""
 }
 
 
@@ -47,8 +54,12 @@ def esc(x):
     return html.escape(str(x or ""))
 
 
-def now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+def now_ct():
+    return datetime.now(CENTRAL)
+
+
+def now_str():
+    return now_ct().strftime("%Y-%m-%d %I:%M:%S %p CT")
 
 
 def uptime():
@@ -67,9 +78,14 @@ def load_state():
     global state
     try:
         with open(STATE_FILE, "r") as f:
-            state = json.load(f)
+            loaded = json.load(f)
+            state.update(loaded)
+            state.setdefault("coins", {})
+            state.setdefault("overnight", False)
+            state.setdefault("digest_queue", [])
+            state.setdefault("last_digest_date", "")
     except:
-        state = {"coins": {}, "manual": []}
+        pass
 
 
 def save_state():
@@ -136,7 +152,8 @@ def tg(text):
             json={
                 "chat_id": CHAT,
                 "text": text,
-                "parse_mode": "HTML"
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False
             },
             timeout=10
         )
@@ -160,7 +177,6 @@ def tg_photo(img, caption):
             )
         else:
             tg(caption)
-
         alerts_sent += 1
     except Exception as e:
         print("telegram photo error", e, flush=True)
@@ -186,33 +202,39 @@ def has_x_link(coin):
 
 def has_emoji(text):
     try:
-        return any(ord(c) > 10000 for c in text)
+        return any(ord(c) > 10000 for c in str(text or ""))
     except:
         return False
 
 
-def create_coin_record(mint, coin, manual=False):
-    name = coin.get("name", "Unknown")
-    symbol = coin.get("symbol", "Unknown")
+def should_buffer(record):
+    if record.get("manual"):
+        return False
 
-    state["coins"][mint] = {
-        "name": name,
-        "symbol": symbol,
-        "peak": float(coin.get("usd_market_cap") or 0),
-        "low": float(coin.get("usd_market_cap") or 999999999),
-        "soft_sent": False,
-        "hard_sent": False,
-        "manual": manual,
-        "img": coin.get("image_uri") or coin.get("image") or ""
-    }
+    if not state.get("overnight", False):
+        return False
 
+    hour = now_ct().hour
+    return hour >= OVERNIGHT_START_HOUR_CT or hour < DIGEST_HOUR_CT
+
+
+def queue_digest(kind, mint, record, current_mc, extra=""):
+    state["digest_queue"].append({
+        "kind": kind,
+        "mint": mint,
+        "name": record.get("name", "Unknown"),
+        "symbol": record.get("symbol", "Unknown"),
+        "current_mc": current_mc,
+        "peak": record.get("peak", 0),
+        "low": record.get("low", 0),
+        "extra": extra,
+        "time": now_str()
+    })
     save_state()
 
 
-def send_soft_alert(mint, record, current_mc):
-    global last_alert
-
-    caption = (
+def format_soft(mint, record, current_mc):
+    return (
         "👀 <b>Revival Watch</b>" + n() + n()
         + "🪙 <b>Name:</b> " + esc(record["name"]) + n()
         + "🏷 <b>Ticker:</b> " + esc(record["symbol"]) + n()
@@ -222,15 +244,9 @@ def send_soft_alert(mint, record, current_mc):
         + "🧬 <code>" + mint + "</code>"
     )
 
-    tg_photo(record["img"], caption)
-    record["soft_sent"] = True
-    last_alert = f"SOFT {record['name']}"
 
-
-def send_hard_alert(mint, record, current_mc, bounce):
-    global last_alert
-
-    caption = (
+def format_hard(mint, record, current_mc, bounce):
+    return (
         "🧟 <b>Revival Alert</b>" + n() + n()
         + "🪙 <b>Name:</b> " + esc(record["name"]) + n()
         + "🏷 <b>Ticker:</b> " + esc(record["symbol"]) + n()
@@ -241,9 +257,67 @@ def send_hard_alert(mint, record, current_mc, bounce):
         + "🧬 <code>" + mint + "</code>"
     )
 
-    tg_photo(record["img"], caption)
+
+def send_soft_alert(mint, record, current_mc):
+    global last_alert
+
+    if should_buffer(record):
+        queue_digest("soft", mint, record, current_mc)
+    else:
+        tg_photo(record.get("img", ""), format_soft(mint, record, current_mc))
+
+    record["soft_sent"] = True
+    last_alert = f"SOFT {record['name']}"
+    save_state()
+
+
+def send_hard_alert(mint, record, current_mc, bounce):
+    global last_alert
+
+    if should_buffer(record):
+        queue_digest("hard", mint, record, current_mc, f"Bounce: {round(bounce, 1)}%")
+    else:
+        tg_photo(record.get("img", ""), format_hard(mint, record, current_mc, bounce))
+
     record["hard_sent"] = True
     last_alert = f"HARD {record['name']}"
+    save_state()
+
+
+def create_coin_record(mint, coin, manual=False):
+    mc = float(coin.get("usd_market_cap") or 0)
+
+    state["coins"][mint] = {
+        "name": coin.get("name", "Unknown"),
+        "symbol": coin.get("symbol", "Unknown"),
+        "peak": mc,
+        "low": mc if mc > 0 else 999999999,
+        "soft_sent": False,
+        "hard_sent": False,
+        "manual": manual,
+        "qualified": manual or mc >= MIN_PEAK_MC,
+        "created_at": time.time(),
+        "img": coin.get("image_uri") or coin.get("image") or ""
+    }
+
+    save_state()
+
+
+def prune_old_unqualified():
+    cutoff = time.time() - (TRACK_UNQUALIFIED_HOURS * 3600)
+    removed = []
+
+    for mint, rec in list(state["coins"].items()):
+        if rec.get("manual"):
+            continue
+        if rec.get("qualified"):
+            continue
+        if rec.get("created_at", 0) < cutoff:
+            removed.append(mint)
+            del state["coins"][mint]
+
+    if removed:
+        save_state()
 
 
 def process_coin(mint, coin):
@@ -259,9 +333,7 @@ def process_coin(mint, coin):
         if has_emoji(name) or has_emoji(symbol):
             return
 
-        if mc >= MIN_PEAK_MC:
-            create_coin_record(mint, coin)
-
+        create_coin_record(mint, coin, manual=False)
         return
 
     record = state["coins"][mint]
@@ -272,6 +344,13 @@ def process_coin(mint, coin):
     if mc < record["low"]:
         record["low"] = mc
 
+    if not record.get("qualified") and record["peak"] >= MIN_PEAK_MC:
+        record["qualified"] = True
+
+    if not record.get("qualified") and not record.get("manual"):
+        save_state()
+        return
+
     if mc >= RESET_MC:
         record["soft_sent"] = False
         record["hard_sent"] = False
@@ -280,22 +359,71 @@ def process_coin(mint, coin):
     if mc <= SOFT_ALERT_MC and not record["soft_sent"]:
         send_soft_alert(mint, record, mc)
 
-    if mc <= HARD_ALERT_MC:
-        if record["low"] > 0:
-            bounce = ((mc - record["low"]) / record["low"]) * 100
-            if bounce >= BOUNCE_PERCENT and not record["hard_sent"]:
-                send_hard_alert(mint, record, mc, bounce)
+    if mc <= HARD_ALERT_MC and record["low"] > 0:
+        bounce = ((mc - record["low"]) / record["low"]) * 100
+        if bounce >= BOUNCE_PERCENT and not record["hard_sent"]:
+            send_hard_alert(mint, record, mc, bounce)
 
     save_state()
+
+
+def digest_text(clear=True):
+    queue = state.get("digest_queue", [])
+
+    if not queue:
+        return "🌅 <b>Overnight Meme Digest</b>" + n() + n() + "No buffered revival alerts."
+
+    lines = [
+        "🌅 <b>Overnight Meme Digest</b>",
+        "",
+        "Found " + str(len(queue)) + " buffered setup(s):",
+        ""
+    ]
+
+    for i, item in enumerate(queue[:15], 1):
+        icon = "🧟" if item["kind"] == "hard" else "👀"
+        lines.append(
+            f"{i}) {icon} <b>{esc(item['name'])}</b> / {esc(item['symbol'])}"
+        )
+        lines.append("MC: " + money(item["current_mc"]))
+        lines.append("Peak: " + money(item["peak"]))
+        if item.get("low"):
+            lines.append("Low: " + money(item["low"]))
+        if item.get("extra"):
+            lines.append(esc(item["extra"]))
+        lines.append("Pump: https://pump.fun/coin/" + item["mint"])
+        lines.append("CA: <code>" + esc(item["mint"]) + "</code>")
+        lines.append("")
+
+    if len(queue) > 15:
+        lines.append("+" + str(len(queue) - 15) + " more buffered alerts not shown.")
+
+    if clear:
+        state["digest_queue"] = []
+        save_state()
+
+    return n().join(lines)
+
+
+def maybe_send_daily_digest():
+    today = now_ct().strftime("%Y-%m-%d")
+    if now_ct().hour == DIGEST_HOUR_CT and state.get("last_digest_date") != today:
+        tg(digest_text(clear=True))
+        state["last_digest_date"] = today
+        save_state()
 
 
 def poll_loop():
     while True:
         try:
+            prune_old_unqualified()
+            maybe_send_daily_digest()
+
             for mint in list(state["coins"].keys()):
                 coin = fetch_coin(mint)
                 if coin:
                     process_coin(mint, coin)
+
         except Exception as e:
             print("poll error", e, flush=True)
 
@@ -343,8 +471,11 @@ def status():
         + "👀 Tokens seen: " + str(tokens_seen) + n()
         + "🚨 Alerts sent: " + str(alerts_sent) + n()
         + "📚 Tracking: " + str(len(state["coins"])) + n()
+        + "🌙 Overnight: " + ("ON" if state.get("overnight") else "OFF") + n()
+        + "📥 Buffered alerts: " + str(len(state.get("digest_queue", []))) + n()
+        + "⏰ Digest: 8:00 AM Central" + n()
         + "📣 Last alert: " + esc(last_alert) + n()
-        + "🕒 " + now()
+        + "🕒 " + now_str()
     )
 
 
@@ -380,6 +511,27 @@ def command_loop():
                     time.sleep(1)
                     os._exit(0)
 
+                elif lower == "/overnight on":
+                    state["overnight"] = True
+                    save_state()
+                    tg("🌙 Overnight mode is now ON.")
+
+                elif lower == "/overnight off":
+                    state["overnight"] = False
+                    save_state()
+                    tg("☀️ Overnight mode is now OFF.")
+
+                elif lower in ["/overnight", "overnight"]:
+                    tg(
+                        "🌙 <b>Overnight Mode</b>" + n() + n()
+                        + "Status: " + ("ON" if state.get("overnight") else "OFF") + n()
+                        + "Digest time: 8:00 AM Central" + n()
+                        + "Buffered alerts: " + str(len(state.get("digest_queue", [])))
+                    )
+
+                elif lower in ["/digest", "digest"]:
+                    tg(digest_text(clear=True))
+
                 elif lower.startswith("/track "):
                     mint = text.split(" ", 1)[1].strip()
                     coin = fetch_coin(mint)
@@ -406,16 +558,21 @@ def command_loop():
                     else:
                         lines = ["📚 <b>Tracked Coins</b>"]
                         for mint, rec in list(state["coins"].items())[:25]:
-                            lines.append(f"• {esc(rec['name'])} — {mint}")
+                            tag = "manual" if rec.get("manual") else ("qualified" if rec.get("qualified") else "watching")
+                            lines.append(f"• {esc(rec['name'])} — {tag} — <code>{mint}</code>")
                         tg(n().join(lines))
 
                 elif lower in ["/help", "help"]:
                     tg(
-                        "🤖 Commands" + n() + n()
+                        "🤖 <b>Commands</b>" + n() + n()
                         + "/status" + n()
                         + "/track CA" + n()
                         + "/untrack CA" + n()
                         + "/tracked" + n()
+                        + "/overnight on" + n()
+                        + "/overnight off" + n()
+                        + "/overnight" + n()
+                        + "/digest" + n()
                         + "/restart"
                     )
 
