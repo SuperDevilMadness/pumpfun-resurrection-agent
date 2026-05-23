@@ -16,16 +16,14 @@ def env_float(name, default):
         return float(default)
     return float(value)
 
-
 def env_int(name, default):
     value = os.getenv(name)
     if value is None or str(value).strip() == "":
         return int(default)
     return int(value)
 
-
 BOT = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT = str(os.getenv("TELEGRAM_CHAT_ID"))
+CHAT = str(os.getenv("TELEGRAM_CHAT_ID") or "")
 
 print("ENV CHECK:", "BOT_SET=" + str(bool(BOT)), "CHAT=" + str(CHAT), flush=True)
 
@@ -34,12 +32,13 @@ SOFT_ALERT_MC = env_float("SOFT_ALERT_MC", 20000)
 HARD_ALERT_MC = env_float("HARD_ALERT_MC", 12000)
 BOUNCE_PERCENT = env_float("BOUNCE_PERCENT", 20)
 RESET_MC = env_float("RESET_MC", 25000)
-POLL_SECONDS = env_int("POLL_SECONDS", 30)
+POLL_SECONDS = env_int("POLL_SECONDS", 90)
 HEARTBEAT_MINUTES = env_int("HEARTBEAT_MINUTES", 60)
 
 DIGEST_HOUR_CT = env_int("DIGEST_HOUR_CT", 8)
 OVERNIGHT_START_HOUR_CT = env_int("OVERNIGHT_START_HOUR_CT", 22)
 TRACK_UNQUALIFIED_HOURS = env_int("TRACK_UNQUALIFIED_HOURS", 24)
+
 STATE_FILE = "/data/resurrection_state.json"
 OFFSET_FILE = "/data/telegram_offset.json"
 
@@ -53,6 +52,8 @@ last_coin = "None yet"
 last_alert = "None yet"
 seen_mints = set()
 
+rate_limited_until = 0
+
 state = {
     "coins": {},
     "overnight": False,
@@ -65,31 +66,28 @@ state = {
         "qualified_count": 0,
         "soft_hits": 0,
         "hard_hits": 0,
-        "delayed_checks_scheduled": 0
+        "delayed_checks_scheduled": 0,
+        "fetch_429s": 0,
+        "fetch_errors": 0,
+        "pruned": 0,
     }
 }
-
 
 def n():
     return "\n"
 
-
 def esc(x):
     return html.escape(str(x or ""))
-
 
 def now_ct():
     return datetime.now(CENTRAL)
 
-
 def now_str():
     return now_ct().strftime("%Y-%m-%d %I:%M:%S %p CT")
-
 
 def uptime():
     s = int(time.time() - start_time)
     return f"{s//3600} hr {(s%3600)//60} min"
-
 
 def money(x):
     try:
@@ -97,11 +95,9 @@ def money(x):
     except:
         return "Unknown"
 
-
-def stat_inc(key):
+def stat_inc(key, amount=1):
     state.setdefault("stats", {})
-    state["stats"][key] = int(state["stats"].get(key, 0)) + 1
-
+    state["stats"][key] = int(state["stats"].get(key, 0)) + amount
 
 def load_state():
     global state
@@ -117,6 +113,7 @@ def load_state():
     state.setdefault("digest_queue", [])
     state.setdefault("last_digest_date", "")
     state.setdefault("stats", {})
+
     for key in [
         "new_coin_checks",
         "x_linked_seen",
@@ -125,9 +122,11 @@ def load_state():
         "soft_hits",
         "hard_hits",
         "delayed_checks_scheduled",
+        "fetch_429s",
+        "fetch_errors",
+        "pruned",
     ]:
         state["stats"].setdefault(key, 0)
-
 
 def save_state():
     try:
@@ -136,7 +135,6 @@ def save_state():
     except Exception as e:
         print("save state error", e, flush=True)
 
-
 def load_offset():
     try:
         with open(OFFSET_FILE, "r") as f:
@@ -144,14 +142,12 @@ def load_offset():
     except:
         return 0
 
-
 def save_offset(offset):
     try:
         with open(OFFSET_FILE, "w") as f:
             json.dump({"offset": offset}, f)
     except:
         pass
-
 
 def drain_updates():
     try:
@@ -169,9 +165,7 @@ def drain_updates():
         pass
     return load_offset()
 
-
 load_state()
-
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -183,12 +177,10 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
 
-
 threading.Thread(
     target=lambda: HTTPServer(("0.0.0.0", 3002), HealthHandler).serve_forever(),
     daemon=True
 ).start()
-
 
 def tg(text):
     try:
@@ -204,7 +196,6 @@ def tg(text):
         )
     except Exception as e:
         print("telegram msg error", e, flush=True)
-
 
 def tg_photo(img, caption):
     global alerts_sent
@@ -226,47 +217,58 @@ def tg_photo(img, caption):
     except Exception as e:
         print("telegram photo error", e, flush=True)
 
-
 def fetch_coin(mint):
+    global rate_limited_until
+
+    if time.time() < rate_limited_until:
+        return None
+
     try:
         url = f"https://frontend-api-v3.pump.fun/coins/{mint}?sync=true"
         r = requests.get(
             url,
-            headers={
-                "User-Agent": "Mozilla/5.0"
-            },
+            headers={"User-Agent": "Mozilla/5.0"},
             timeout=10
         )
 
+        if r.status_code == 429:
+            stat_inc("fetch_429s")
+            rate_limited_until = time.time() + 60
+            print("429 rate limited; backing off 60 sec", flush=True)
+            save_state()
+            return None
+
         if r.status_code != 200:
+            stat_inc("fetch_errors")
             print("fetch status", r.status_code, "for", mint, flush=True)
+            save_state()
             return None
 
         text = r.text.strip()
-
         if not text:
+            stat_inc("fetch_errors")
             print("fetch empty response for", mint, flush=True)
+            save_state()
             return None
 
         d = r.json()
         return d.get("data", d)
 
     except Exception as e:
+        stat_inc("fetch_errors")
         print("fetch error", e, flush=True)
+        save_state()
         return None
-
 
 def has_x_link(coin):
     blob = json.dumps(coin).lower()
     return "twitter.com" in blob or "x.com" in blob
-
 
 def has_emoji(text):
     try:
         return any(ord(c) > 10000 for c in str(text or ""))
     except:
         return False
-
 
 def should_buffer(record):
     if record.get("manual"):
@@ -276,7 +278,6 @@ def should_buffer(record):
 
     hour = now_ct().hour
     return hour >= OVERNIGHT_START_HOUR_CT or hour < DIGEST_HOUR_CT
-
 
 def queue_digest(kind, mint, record, current_mc, extra=""):
     state["digest_queue"].append({
@@ -292,7 +293,6 @@ def queue_digest(kind, mint, record, current_mc, extra=""):
     })
     save_state()
 
-
 def format_soft(mint, record, current_mc):
     return (
         "👀 <b>Revival Watch</b>" + n() + n()
@@ -303,7 +303,6 @@ def format_soft(mint, record, current_mc):
         + "🚀 https://pump.fun/coin/" + mint + n() + n()
         + "🧬 <code>" + mint + "</code>"
     )
-
 
 def format_hard(mint, record, current_mc, bounce):
     return (
@@ -316,7 +315,6 @@ def format_hard(mint, record, current_mc, bounce):
         + "🚀 https://pump.fun/coin/" + mint + n() + n()
         + "🧬 <code>" + mint + "</code>"
     )
-
 
 def send_soft_alert(mint, record, current_mc):
     global last_alert
@@ -331,7 +329,6 @@ def send_soft_alert(mint, record, current_mc):
     last_alert = f"SOFT {record['name']}"
     save_state()
 
-
 def send_hard_alert(mint, record, current_mc, bounce):
     global last_alert
 
@@ -344,7 +341,6 @@ def send_hard_alert(mint, record, current_mc, bounce):
     stat_inc("hard_hits")
     last_alert = f"HARD {record['name']}"
     save_state()
-
 
 def create_coin_record(mint, coin, manual=False):
     mc = float(coin.get("usd_market_cap") or 0)
@@ -369,10 +365,9 @@ def create_coin_record(mint, coin, manual=False):
 
     save_state()
 
-
 def prune_old_unqualified():
     cutoff = time.time() - (TRACK_UNQUALIFIED_HOURS * 3600)
-    removed = []
+    removed = 0
 
     for mint, rec in list(state["coins"].items()):
         if rec.get("manual"):
@@ -380,12 +375,14 @@ def prune_old_unqualified():
         if rec.get("qualified"):
             continue
         if rec.get("created_at", 0) < cutoff:
-            removed.append(mint)
             del state["coins"][mint]
+            removed += 1
 
     if removed:
+        stat_inc("pruned", removed)
         save_state()
 
+    return removed
 
 def process_coin(mint, coin):
     mc = float(coin.get("usd_market_cap") or 0)
@@ -443,20 +440,17 @@ def process_coin(mint, coin):
 
     save_state()
 
-
 def delayed_check(mint, delay):
     time.sleep(delay)
     coin = fetch_coin(mint)
     if coin:
         process_coin(mint, coin)
 
-
 def schedule_delayed_checks(mint):
-    for delay in [2, 15, 60, 180]:
+    for delay in [10, 45, 180]:
         stat_inc("delayed_checks_scheduled")
         threading.Thread(target=delayed_check, args=(mint, delay), daemon=True).start()
     save_state()
-
 
 def digest_text(clear=True):
     queue = state.get("digest_queue", [])
@@ -493,14 +487,12 @@ def digest_text(clear=True):
 
     return n().join(lines)
 
-
 def maybe_send_daily_digest():
     today = now_ct().strftime("%Y-%m-%d")
     if now_ct().hour == DIGEST_HOUR_CT and state.get("last_digest_date") != today:
         tg(digest_text(clear=True))
         state["last_digest_date"] = today
         save_state()
-
 
 def poll_loop():
     while True:
@@ -513,11 +505,12 @@ def poll_loop():
                 if coin:
                     process_coin(mint, coin)
 
+                time.sleep(1.5)
+
         except Exception as e:
             print("poll error", e, flush=True)
 
         time.sleep(POLL_SECONDS)
-
 
 def websocket_new_token(ws, message):
     global tokens_seen, last_coin
@@ -538,17 +531,14 @@ def websocket_new_token(ws, message):
     except Exception as e:
         print("ws msg error", e, flush=True)
 
-
 def on_open(ws):
     global ws_connected
     ws_connected = True
     ws.send(json.dumps({"method": "subscribeNewToken"}))
 
-
 def on_close(ws, *args):
     global ws_connected
     ws_connected = False
-
 
 def candidates_text():
     coins = list(state["coins"].items())
@@ -571,6 +561,28 @@ def candidates_text():
 
     return n().join(lines)
 
+def strategy_stats_text():
+    stats = state.get("stats", {})
+    qualified = len([c for c in state["coins"].values() if c.get("qualified")])
+    manual = len([c for c in state["coins"].values() if c.get("manual")])
+    watching = len([c for c in state["coins"].values() if not c.get("qualified") and not c.get("manual")])
+
+    return (
+        "📊 <b>Strategy Stats</b>" + n() + n()
+        + "👀 Tokens seen: " + str(tokens_seen) + n()
+        + "🔎 New coin checks: " + str(stats.get("new_coin_checks", 0)) + n()
+        + "🐦 X-linked seen: " + str(stats.get("x_linked_seen", 0)) + n()
+        + "🚫 Emoji rejected: " + str(stats.get("emoji_rejected", 0)) + n()
+        + "✅ Qualified: " + str(qualified) + n()
+        + "👁 Watching unqualified: " + str(watching) + n()
+        + "✍️ Manual tracked: " + str(manual) + n()
+        + "👀 Soft hits: " + str(stats.get("soft_hits", 0)) + n()
+        + "🧟 Hard hits: " + str(stats.get("hard_hits", 0)) + n()
+        + "📚 Total tracking: " + str(len(state["coins"])) + n()
+        + "🧹 Pruned: " + str(stats.get("pruned", 0)) + n()
+        + "🚧 Fetch 429s: " + str(stats.get("fetch_429s", 0)) + n()
+        + "⚠️ Fetch errors: " + str(stats.get("fetch_errors", 0))
+    )
 
 def status():
     stats = state.get("stats", {})
@@ -583,15 +595,12 @@ def status():
         + "🔌 Websocket: " + ("connected" if ws_connected else "disconnected") + n()
         + "⏱ Uptime: " + uptime() + n()
         + "👀 Tokens seen: " + str(tokens_seen) + n()
-        + "🔎 New coin checks: " + str(stats.get("new_coin_checks", 0)) + n()
         + "🐦 X-linked seen: " + str(stats.get("x_linked_seen", 0)) + n()
-        + "🚫 Emoji rejected: " + str(stats.get("emoji_rejected", 0)) + n()
         + "✅ Qualified: " + str(qualified) + n()
-        + "👁 Watching unqualified: " + str(watching) + n()
-        + "✍️ Manual tracked: " + str(manual) + n()
+        + "👁 Watching: " + str(watching) + n()
+        + "✍️ Manual: " + str(manual) + n()
         + "🚨 Alerts sent: " + str(alerts_sent) + n()
-        + "👀 Soft hits: " + str(stats.get("soft_hits", 0)) + n()
-        + "🧟 Hard hits: " + str(stats.get("hard_hits", 0)) + n()
+        + "🚧 429s: " + str(stats.get("fetch_429s", 0)) + n()
         + "📚 Total tracking: " + str(len(state["coins"])) + n()
         + "🌙 Overnight: " + ("ON" if state.get("overnight") else "OFF") + n()
         + "📥 Buffered alerts: " + str(len(state.get("digest_queue", []))) + n()
@@ -599,7 +608,6 @@ def status():
         + "📣 Last alert: " + esc(last_alert) + n()
         + "🕒 " + now_str()
     )
-
 
 def command_loop():
     offset = drain_updates()
@@ -628,8 +636,15 @@ def command_loop():
                 if lower in ["/status", "status"]:
                     tg(status())
 
+                elif lower in ["/stats", "stats"]:
+                    tg(strategy_stats_text())
+
                 elif lower in ["/candidates", "candidates"]:
                     tg(candidates_text())
+
+                elif lower in ["/prune", "prune"]:
+                    removed = prune_old_unqualified()
+                    tg("🧹 Pruned " + str(removed) + " old unqualified coin(s).")
 
                 elif lower in ["/restart", "restart"]:
                     tg("♻️ Restarting resurrection hunter...")
@@ -684,7 +699,9 @@ def command_loop():
                     tg(
                         "🤖 <b>Commands</b>" + n() + n()
                         + "/status" + n()
+                        + "/stats" + n()
                         + "/candidates" + n()
+                        + "/prune" + n()
                         + "/track CA" + n()
                         + "/untrack CA" + n()
                         + "/tracked" + n()
@@ -699,12 +716,10 @@ def command_loop():
             print("command error", e, flush=True)
             time.sleep(5)
 
-
 def heartbeat():
     while True:
         time.sleep(HEARTBEAT_MINUTES * 60)
         tg("🟢 Scheduled Checkup" + n() + n() + status())
-
 
 threading.Thread(target=poll_loop, daemon=True).start()
 threading.Thread(target=command_loop, daemon=True).start()
