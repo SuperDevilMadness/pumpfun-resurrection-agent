@@ -10,21 +10,34 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 import websocket
 
+def env_float(name, default):
+    value = os.getenv(name)
+    if value is None or str(value).strip() == "":
+        return float(default)
+    return float(value)
+
+
+def env_int(name, default):
+    value = os.getenv(name)
+    if value is None or str(value).strip() == "":
+        return int(default)
+    return int(value)
+
+
 BOT = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT = str(os.getenv("TELEGRAM_CHAT_ID"))
 
-MIN_PEAK_MC = float(os.getenv("MIN_PEAK_MC", "30000"))
-SOFT_ALERT_MC = float(os.getenv("SOFT_ALERT_MC", "20000"))
-HARD_ALERT_MC = float(os.getenv("HARD_ALERT_MC", "12000"))
-BOUNCE_PERCENT = float(os.getenv("BOUNCE_PERCENT", "20"))
-RESET_MC = float(os.getenv("RESET_MC", "25000"))
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
-HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "60"))
+MIN_PEAK_MC = env_float("MIN_PEAK_MC", 30000)
+SOFT_ALERT_MC = env_float("SOFT_ALERT_MC", 20000)
+HARD_ALERT_MC = env_float("HARD_ALERT_MC", 12000)
+BOUNCE_PERCENT = env_float("BOUNCE_PERCENT", 20)
+RESET_MC = env_float("RESET_MC", 25000)
+POLL_SECONDS = env_int("POLL_SECONDS", 30)
+HEARTBEAT_MINUTES = env_int("HEARTBEAT_MINUTES", 60)
 
-DIGEST_HOUR_CT = int(os.getenv("DIGEST_HOUR_CT", "8"))
-OVERNIGHT_START_HOUR_CT = int(os.getenv("OVERNIGHT_START_HOUR_CT", "22"))
-TRACK_UNQUALIFIED_HOURS = int(os.getenv("TRACK_UNQUALIFIED_HOURS", "24"))
-
+DIGEST_HOUR_CT = env_int("DIGEST_HOUR_CT", 8)
+OVERNIGHT_START_HOUR_CT = env_int("OVERNIGHT_START_HOUR_CT", 22)
+TRACK_UNQUALIFIED_HOURS = env_int("TRACK_UNQUALIFIED_HOURS", 24)
 STATE_FILE = "/data/resurrection_state.json"
 OFFSET_FILE = "/data/telegram_offset.json"
 
