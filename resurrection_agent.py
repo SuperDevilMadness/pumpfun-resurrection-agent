@@ -27,6 +27,8 @@ def env_int(name, default):
 BOT = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT = str(os.getenv("TELEGRAM_CHAT_ID"))
 
+print("ENV CHECK:", "BOT_SET=" + str(bool(BOT)), "CHAT=" + str(CHAT), flush=True)
+
 MIN_PEAK_MC = env_float("MIN_PEAK_MC", 30000)
 SOFT_ALERT_MC = env_float("SOFT_ALERT_MC", 20000)
 HARD_ALERT_MC = env_float("HARD_ALERT_MC", 12000)
@@ -176,6 +178,10 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"running")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
 
 threading.Thread(
