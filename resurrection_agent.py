@@ -229,12 +229,28 @@ def tg_photo(img, caption):
 
 def fetch_coin(mint):
     try:
+        url = f"https://frontend-api-v3.pump.fun/coins/{mint}?sync=true"
         r = requests.get(
-            f"https://frontend-api-v3.pump.fun/coins/{mint}?sync=true",
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0"
+            },
             timeout=10
         )
+
+        if r.status_code != 200:
+            print("fetch status", r.status_code, "for", mint, flush=True)
+            return None
+
+        text = r.text.strip()
+
+        if not text:
+            print("fetch empty response for", mint, flush=True)
+            return None
+
         d = r.json()
         return d.get("data", d)
+
     except Exception as e:
         print("fetch error", e, flush=True)
         return None
