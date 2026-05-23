@@ -42,7 +42,16 @@ state = {
     "coins": {},
     "overnight": False,
     "digest_queue": [],
-    "last_digest_date": ""
+    "last_digest_date": "",
+    "stats": {
+        "new_coin_checks": 0,
+        "x_linked_seen": 0,
+        "emoji_rejected": 0,
+        "qualified_count": 0,
+        "soft_hits": 0,
+        "hard_hits": 0,
+        "delayed_checks_scheduled": 0
+    }
 }
 
 
@@ -74,18 +83,35 @@ def money(x):
         return "Unknown"
 
 
+def stat_inc(key):
+    state.setdefault("stats", {})
+    state["stats"][key] = int(state["stats"].get(key, 0)) + 1
+
+
 def load_state():
     global state
     try:
         with open(STATE_FILE, "r") as f:
             loaded = json.load(f)
             state.update(loaded)
-            state.setdefault("coins", {})
-            state.setdefault("overnight", False)
-            state.setdefault("digest_queue", [])
-            state.setdefault("last_digest_date", "")
     except:
         pass
+
+    state.setdefault("coins", {})
+    state.setdefault("overnight", False)
+    state.setdefault("digest_queue", [])
+    state.setdefault("last_digest_date", "")
+    state.setdefault("stats", {})
+    for key in [
+        "new_coin_checks",
+        "x_linked_seen",
+        "emoji_rejected",
+        "qualified_count",
+        "soft_hits",
+        "hard_hits",
+        "delayed_checks_scheduled",
+    ]:
+        state["stats"].setdefault(key, 0)
 
 
 def save_state():
@@ -210,7 +236,6 @@ def has_emoji(text):
 def should_buffer(record):
     if record.get("manual"):
         return False
-
     if not state.get("overnight", False):
         return False
 
@@ -267,6 +292,7 @@ def send_soft_alert(mint, record, current_mc):
         tg_photo(record.get("img", ""), format_soft(mint, record, current_mc))
 
     record["soft_sent"] = True
+    stat_inc("soft_hits")
     last_alert = f"SOFT {record['name']}"
     save_state()
 
@@ -280,6 +306,7 @@ def send_hard_alert(mint, record, current_mc, bounce):
         tg_photo(record.get("img", ""), format_hard(mint, record, current_mc, bounce))
 
     record["hard_sent"] = True
+    stat_inc("hard_hits")
     last_alert = f"HARD {record['name']}"
     save_state()
 
@@ -291,14 +318,19 @@ def create_coin_record(mint, coin, manual=False):
         "name": coin.get("name", "Unknown"),
         "symbol": coin.get("symbol", "Unknown"),
         "peak": mc,
+        "current_mc": mc,
         "low": mc if mc > 0 else 999999999,
         "soft_sent": False,
         "hard_sent": False,
         "manual": manual,
         "qualified": manual or mc >= MIN_PEAK_MC,
         "created_at": time.time(),
+        "last_checked": time.time(),
         "img": coin.get("image_uri") or coin.get("image") or ""
     }
+
+    if state["coins"][mint]["qualified"]:
+        stat_inc("qualified_count")
 
     save_state()
 
@@ -324,19 +356,28 @@ def process_coin(mint, coin):
     mc = float(coin.get("usd_market_cap") or 0)
 
     if mint not in state["coins"]:
+        stat_inc("new_coin_checks")
+
         if not has_x_link(coin):
+            save_state()
             return
+
+        stat_inc("x_linked_seen")
 
         name = coin.get("name", "")
         symbol = coin.get("symbol", "")
 
         if has_emoji(name) or has_emoji(symbol):
+            stat_inc("emoji_rejected")
+            save_state()
             return
 
         create_coin_record(mint, coin, manual=False)
         return
 
     record = state["coins"][mint]
+    record["current_mc"] = mc
+    record["last_checked"] = time.time()
 
     if mc > record["peak"]:
         record["peak"] = mc
@@ -346,6 +387,7 @@ def process_coin(mint, coin):
 
     if not record.get("qualified") and record["peak"] >= MIN_PEAK_MC:
         record["qualified"] = True
+        stat_inc("qualified_count")
 
     if not record.get("qualified") and not record.get("manual"):
         save_state()
@@ -367,6 +409,20 @@ def process_coin(mint, coin):
     save_state()
 
 
+def delayed_check(mint, delay):
+    time.sleep(delay)
+    coin = fetch_coin(mint)
+    if coin:
+        process_coin(mint, coin)
+
+
+def schedule_delayed_checks(mint):
+    for delay in [2, 15, 60, 180]:
+        stat_inc("delayed_checks_scheduled")
+        threading.Thread(target=delayed_check, args=(mint, delay), daemon=True).start()
+    save_state()
+
+
 def digest_text(clear=True):
     queue = state.get("digest_queue", [])
 
@@ -382,9 +438,7 @@ def digest_text(clear=True):
 
     for i, item in enumerate(queue[:15], 1):
         icon = "🧟" if item["kind"] == "hard" else "👀"
-        lines.append(
-            f"{i}) {icon} <b>{esc(item['name'])}</b> / {esc(item['symbol'])}"
-        )
+        lines.append(f"{i}) {icon} <b>{esc(item['name'])}</b> / {esc(item['symbol'])}")
         lines.append("MC: " + money(item["current_mc"]))
         lines.append("Peak: " + money(item["peak"]))
         if item.get("low"):
@@ -444,9 +498,7 @@ def websocket_new_token(ws, message):
         tokens_seen += 1
         last_coin = mint
 
-        coin = fetch_coin(mint)
-        if coin:
-            process_coin(mint, coin)
+        schedule_delayed_checks(mint)
 
     except Exception as e:
         print("ws msg error", e, flush=True)
@@ -463,14 +515,49 @@ def on_close(ws, *args):
     ws_connected = False
 
 
+def candidates_text():
+    coins = list(state["coins"].items())
+
+    if not coins:
+        return "📚 No candidates tracked yet."
+
+    coins.sort(key=lambda item: item[1].get("peak", 0), reverse=True)
+
+    lines = ["📚 <b>Top Candidates</b>", ""]
+
+    for mint, rec in coins[:20]:
+        status = "manual" if rec.get("manual") else ("qualified" if rec.get("qualified") else "watching")
+        lines.append(
+            "• <b>" + esc(rec.get("name")) + "</b> / " + esc(rec.get("symbol")) + " — " + status
+        )
+        lines.append("  MC: " + money(rec.get("current_mc")) + " | Peak: " + money(rec.get("peak")) + " | Low: " + money(rec.get("low")))
+        lines.append("  <code>" + esc(mint) + "</code>")
+        lines.append("")
+
+    return n().join(lines)
+
+
 def status():
+    stats = state.get("stats", {})
+    qualified = len([c for c in state["coins"].values() if c.get("qualified")])
+    manual = len([c for c in state["coins"].values() if c.get("manual")])
+    watching = len([c for c in state["coins"].values() if not c.get("qualified") and not c.get("manual")])
+
     return (
         "✅ <b>Resurrection Hunter</b>" + n() + n()
         + "🔌 Websocket: " + ("connected" if ws_connected else "disconnected") + n()
         + "⏱ Uptime: " + uptime() + n()
         + "👀 Tokens seen: " + str(tokens_seen) + n()
+        + "🔎 New coin checks: " + str(stats.get("new_coin_checks", 0)) + n()
+        + "🐦 X-linked seen: " + str(stats.get("x_linked_seen", 0)) + n()
+        + "🚫 Emoji rejected: " + str(stats.get("emoji_rejected", 0)) + n()
+        + "✅ Qualified: " + str(qualified) + n()
+        + "👁 Watching unqualified: " + str(watching) + n()
+        + "✍️ Manual tracked: " + str(manual) + n()
         + "🚨 Alerts sent: " + str(alerts_sent) + n()
-        + "📚 Tracking: " + str(len(state["coins"])) + n()
+        + "👀 Soft hits: " + str(stats.get("soft_hits", 0)) + n()
+        + "🧟 Hard hits: " + str(stats.get("hard_hits", 0)) + n()
+        + "📚 Total tracking: " + str(len(state["coins"])) + n()
         + "🌙 Overnight: " + ("ON" if state.get("overnight") else "OFF") + n()
         + "📥 Buffered alerts: " + str(len(state.get("digest_queue", []))) + n()
         + "⏰ Digest: 8:00 AM Central" + n()
@@ -505,6 +592,9 @@ def command_loop():
 
                 if lower in ["/status", "status"]:
                     tg(status())
+
+                elif lower in ["/candidates", "candidates"]:
+                    tg(candidates_text())
 
                 elif lower in ["/restart", "restart"]:
                     tg("♻️ Restarting resurrection hunter...")
@@ -553,19 +643,13 @@ def command_loop():
                         tg("Not tracked.")
 
                 elif lower in ["/tracked", "tracked"]:
-                    if not state["coins"]:
-                        tg("No tracked coins.")
-                    else:
-                        lines = ["📚 <b>Tracked Coins</b>"]
-                        for mint, rec in list(state["coins"].items())[:25]:
-                            tag = "manual" if rec.get("manual") else ("qualified" if rec.get("qualified") else "watching")
-                            lines.append(f"• {esc(rec['name'])} — {tag} — <code>{mint}</code>")
-                        tg(n().join(lines))
+                    tg(candidates_text())
 
                 elif lower in ["/help", "help"]:
                     tg(
                         "🤖 <b>Commands</b>" + n() + n()
                         + "/status" + n()
+                        + "/candidates" + n()
                         + "/track CA" + n()
                         + "/untrack CA" + n()
                         + "/tracked" + n()
